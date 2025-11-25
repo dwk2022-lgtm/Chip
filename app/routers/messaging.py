@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 from datetime import datetime, timedelta
+import os
 
 from fastapi import APIRouter, HTTPException, Body, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+# --- NEW IMPORTS FOR INTELLIGENCE ---
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage, HumanMessage
+except ImportError:
+    # Fallback imports in case you are using an older version of LangChain
+    from langchain.chat_models import ChatOpenAI
+    from langchain.schema import SystemMessage, HumanMessage
+# ------------------------------------
 
 from app.adapters.registry import AdapterRegistry
 from app.types import (
@@ -70,6 +81,65 @@ def _mark_message_processed(message_id: str | None, recipient: str | None, text:
     _processed_messages[key] = datetime.now()
 
 
+# --- NEW INTELLIGENT PROCESSING FUNCTION ---
+async def _process_input_intelligently(raw_text: str) -> tuple[str, str]:
+    """
+    1. Corrects spelling/grammar of the input using a fast LLM.
+    2. Retrieves RAG context based on the CORRECTED text.
+    3. Appends a 'General Q&A' instruction to the context to allow off-topic answers.
+    
+    Returns: (corrected_text, enhanced_context)
+    """
+    corrected_text = raw_text
+    
+    # 1. Spelling Correction
+    try:
+        # Using gpt-3.5-turbo or similar fast model for quick correction
+        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        
+        messages = [
+            SystemMessage(content=(
+                "You are a text cleaner. Your task is to correct any spelling or grammatical errors "
+                "in the user's message to make it suitable for a search engine. "
+                "Do not change the meaning. If the text is already correct or is a casual greeting, return it exactly as is. "
+                "Output ONLY the corrected text."
+            )),
+            HumanMessage(content=raw_text)
+        ]
+        # Await the async call to avoid blocking
+        result = await llm.ainvoke(messages)
+        corrected_text = result.content.strip()
+        
+        # Safety check: if LLM returns empty, revert to raw
+        if not corrected_text:
+            corrected_text = raw_text
+            
+    except Exception as e:
+        print(f"Warning: Spelling correction failed ({e}). Using raw text.")
+        corrected_text = raw_text
+
+    # 2. Fetch Context (using corrected text for better matching)
+    try:
+        context = _rag_service.get_context_for_query(corrected_text)
+    except Exception as e:
+        print(f"Warning: RAG service failed ({e}).")
+        context = ""
+
+    # 3. General Q&A Fallback Instruction
+    # We append this to the context so the downstream agent knows it's okay to answer generally.
+    general_instruction = (
+        "\n\n[SYSTEM INSTRUCTION: The user's query might be about general topics (weather, small talk, general knowledge) "
+        "that are not in the database. If the retrieved context above is empty or irrelevant to the user's specific question, "
+        "please ignore the context and answer the user's question helpfully using your general knowledge. "
+        "Do not say 'I don't know' just because it's not in the context. Be conversational.]"
+    )
+    
+    enhanced_context = (context or "") + general_instruction
+    
+    return corrected_text, enhanced_context
+# -------------------------------------------
+
+
 @router.post("/messages/send")
 async def send_message(payload: SendMessageRequest) -> SendMessageResponse:
     adapter = AdapterRegistry.get(payload.provider)
@@ -133,12 +203,20 @@ async def webhook_events(
 
     if recipient and text and text.strip():
         try:
-            context = _rag_service.get_context_for_query(normalized.text)
+            # --- MODIFIED LOGIC START ---
+            # Instead of getting context directly, we process the input first
+            # to fix spelling and prepare the context for general queries.
+            corrected_text, enhanced_context = await _process_input_intelligently(text)
+            
+            # Debug log to see what changed
+            print(f"Original: {text} | Corrected: {corrected_text}")
+
             reply_text, submission_data = generate_reply_with_langchain(
-                user_message=text,
-                context=context,
+                user_message=corrected_text,  # Pass the fixed text
+                context=enhanced_context,     # Pass the enhanced context
                 user_id=str(user_id) if user_id else None,
             )
+            # --- MODIFIED LOGIC END ---
             
             if submission_data and user_id:
                 try:
